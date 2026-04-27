@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv
+venv/
+
+# Data — do NOT commit raw dataset (large files)
+data/raw/
+data/intermediate/
+data/checkpoints/
+
+# Test outputs
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Secrets
+.env
+*.pem
+*.key

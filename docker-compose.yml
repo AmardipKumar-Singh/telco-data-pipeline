@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  # --- Kafka + ZooKeeper ---
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports: ["2181:2181"]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  # --- PostgreSQL ---
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: telco_pipeline
+      POSTGRES_USER: pipeline_user
+      POSTGRES_PASSWORD: changeme
+    ports: ["5432:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # --- Apache Spark (Standalone Master + Worker) ---
+  spark-master:
+    image: bitnami/spark:3.5
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "8080:8080"  # Spark UI
+      - "7077:7077"  # Spark master port
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    depends_on: [spark-master]
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_CORES=2
+
+volumes:
+  postgres_data:

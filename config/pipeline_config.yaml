@@ -1,0 +1,128 @@
+# Telco Data Pipeline Configuration
+# Defines the full pipeline: sources, stages, storage, and orchestration settings
+
+pipeline:
+  name: telco_troubleshooting_pipeline
+  version: "1.0.0"
+  description: >
+    Ingests AI Telco Troubleshooting Challenge data,
+    performs Spark-based feature engineering, and writes
+    aggregated results to PostgreSQL for downstream ML training.
+
+# --- Kafka Source Configuration ---
+kafka:
+  bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}"
+  topic_input: telco_alarms_raw
+  topic_output: telco_alarms_processed
+  consumer_group: telco_pipeline_cg
+  batch_size: 1000
+  poll_timeout_ms: 5000
+  auto_offset_reset: earliest
+
+# --- PostgreSQL Configuration ---
+sql:
+  host: "${POSTGRES_HOST:-localhost}"
+  port: 5432
+  database: "${POSTGRES_DB:-telco_pipeline}"
+  user: "${POSTGRES_USER:-pipeline_user}"
+  password: "${POSTGRES_PASSWORD:-changeme}"
+  pool_size: 10
+  max_overflow: 5
+  tables:
+    raw_events: telco_alarm_events
+    aggregated: telco_alarm_aggregations
+    pipeline_metrics: pipeline_run_metrics
+
+# --- HDFS / Local FS Configuration ---
+storage:
+  mode: local  # Options: local | hdfs
+  local_base_path: "./data/intermediate"
+  hdfs_base_path: "hdfs://localhost:9000/telco_pipeline"
+  checkpoint_dir: "./data/checkpoints"
+  parquet_compression: snappy
+
+# --- Spark Configuration ---
+spark:
+  app_name: TelcoPipeline
+  master: "local[4]"  # Change to yarn/k8s for cluster
+  executor_memory: 4g
+  driver_memory: 2g
+  parallelism: 8
+  shuffle_partitions: 8
+  log_level: WARN
+
+# --- Pipeline Stages ---
+stages:
+  - name: ingest
+    type: KafkaConnector
+    enabled: true
+    config:
+      batch_mode: true  # Use file ingestion in local/demo mode
+      input_file: "./data/raw"
+
+  - name: validate
+    type: DataValidator
+    enabled: true
+    config:
+      required_columns:
+        - alarm_id
+        - cell_id
+        - alarm_type
+        - severity
+        - timestamp
+      null_threshold: 0.05  # Max 5% nulls per column
+
+  - name: feature_engineering
+    type: TelcoFeatureEngineeringStage
+    enabled: true
+    config:
+      window_duration_minutes: 15
+      alarm_correlation_threshold: 0.7
+      kpi_columns:
+        - rsrp
+        - sinr
+        - prb_utilization
+        - handover_success_rate
+
+  - name: spark_transform
+    type: SparkTransformationStage
+    enabled: true
+    config:
+      operations:
+        - type: filter
+          condition: "severity IN ('CRITICAL', 'MAJOR')"
+        - type: window_agg
+          partition_by: [cell_id, alarm_type]
+          order_by: timestamp
+          window_minutes: 60
+
+  - name: sql_aggregation
+    type: SQLAggregationStage
+    enabled: true
+    config:
+      query: >
+        SELECT
+          cell_id,
+          alarm_type,
+          COUNT(*) AS alarm_count,
+          AVG(severity_score) AS avg_severity,
+          MAX(timestamp) AS last_seen,
+          ARRAY_AGG(DISTINCT resolution_category) AS resolution_categories
+        FROM staging_events
+        GROUP BY cell_id, alarm_type
+      output_table: telco_alarm_aggregations
+
+  - name: write_results
+    type: SQLConnector
+    enabled: true
+    config:
+      mode: upsert
+      conflict_columns: [cell_id, alarm_type]
+
+# --- Orchestration Settings ---
+orchestration:
+  max_retries: 3
+  retry_backoff_seconds: 5
+  checkpoint_on_failure: true
+  metrics_log_interval_seconds: 30
+  backpressure_threshold: 5000  # Max queue depth before pausing
