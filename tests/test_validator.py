@@ -1,50 +1,62 @@
-"""Unit tests for DataValidator."""
+"""Tests for DataValidator using the Telco QA dataset schema."""
 
-import pytest
+from __future__ import annotations
+
 import pandas as pd
-import numpy as np
+import pytest
 
-from src.validator import DataValidator
 from src.exceptions import ValidationError
+from src.validator import DataValidator
 
 
 @pytest.fixture
-def valid_df():
+def valid_df() -> pd.DataFrame:
     return pd.DataFrame({
-        "alarm_id": ["A1", "A2"],
-        "cell_id": ["C1", "C2"],
-        "severity": ["CRITICAL", "MINOR"],
+        "question": ["Q1", "Q2", "Q3"],
+        "answer": ["A", "B", "C"],
+        "choices": [["A", "B"], ["C", "D"], ["E", "F"]],
     })
 
 
-def test_validator_passes_valid_data(valid_df):
-    v = DataValidator(required_columns=["alarm_id", "cell_id", "severity"])
-    v.validate(valid_df)  # Should not raise
+@pytest.fixture
+def validator() -> DataValidator:
+    return DataValidator()
 
 
-def test_validator_raises_on_empty_df():
-    v = DataValidator()
-    with pytest.raises(ValidationError, match="empty"):
-        v.validate(pd.DataFrame())
+class TestDataValidator:
+    def test_valid_df_passes(self, validator, valid_df):
+        validator.validate(valid_df)   # no exception
 
+    def test_empty_df_raises(self, validator):
+        with pytest.raises(ValidationError, match="empty"):
+            validator.validate(pd.DataFrame())
 
-def test_validator_raises_on_missing_columns(valid_df):
-    v = DataValidator(required_columns=["alarm_id", "missing_col"])
-    with pytest.raises(ValidationError, match="Missing"):
-        v.validate(valid_df)
+    def test_missing_required_column_raises(self, validator):
+        df = pd.DataFrame({"question": ["Q1"]})   # missing 'answer'
+        with pytest.raises(ValidationError, match="Missing required columns"):
+            validator.validate(df)
 
+    def test_null_threshold_enforced_on_required_columns(self):
+        v = DataValidator(
+            required_columns=["question", "answer"], null_threshold=0.1
+        )
+        df = pd.DataFrame({
+            "question": ["Q1", None, None],   # 66 % nulls — over threshold
+            "answer": ["A", "B", "C"],
+        })
+        with pytest.raises(ValidationError, match="Null rate threshold"):
+            v.validate(df)
 
-def test_validator_raises_on_null_threshold():
-    df = pd.DataFrame({
-        "alarm_id": ["A1", None, None],  # 66% nulls
-        "cell_id": ["C1", "C2", "C3"],
-    })
-    v = DataValidator(null_threshold=0.05)
-    with pytest.raises(ValidationError, match="Null rate"):
-        v.validate(df)
+    def test_optional_columns_not_checked_for_nulls(self):
+        """context is not required — should not trigger null threshold."""
+        v = DataValidator(required_columns=["question", "answer"], null_threshold=0.05)
+        df = pd.DataFrame({
+            "question": ["Q1", "Q2"],
+            "answer": ["A", "B"],
+            "context": [None, None],   # 100 % null but optional
+        })
+        v.validate(df)   # should pass
 
-
-def test_validator_repr():
-    v = DataValidator(required_columns=["a", "b"], null_threshold=0.1)
-    assert "DataValidator" in repr(v)
-    assert "null_threshold=0.1" in repr(v)
+    def test_repr(self, validator):
+        assert "DataValidator" in repr(validator)
+        assert "question" in repr(validator)

@@ -5,6 +5,9 @@ because validation logic is orthogonal to transformation logic — it answers
 "is this data safe to process?" rather than "transform this data".
 This lets PipelineManager inject validation between any two stages without
 modifying stage implementations (Open/Closed principle).
+
+Updated default required_columns to match the AI Telco Troubleshooting
+Challenge dataset schema (question / answer / choices).
 """
 
 from __future__ import annotations
@@ -18,14 +21,18 @@ from src.exceptions import ValidationError
 
 logger = logging.getLogger(__name__)
 
+# Default required columns for the Telco Troubleshooting dataset
+TELCO_REQUIRED_COLUMNS: list[str] = ["question", "answer"]
+
 
 class DataValidator:
     """Schema and quality validator for pipeline DataFrames.
 
     Args:
-        required_columns: List of column names that must be present.
-        null_threshold: Maximum fraction of nulls allowed per column (0-1).
-        name: Human-readable name for logging.
+        required_columns: Column names that must be present.
+                          Defaults to TELCO_REQUIRED_COLUMNS.
+        null_threshold:   Maximum fraction of nulls allowed per column (0-1).
+        name:             Human-readable name for logging.
     """
 
     def __init__(
@@ -34,7 +41,10 @@ class DataValidator:
         null_threshold: float = 0.05,
         name: str = "DataValidator",
     ) -> None:
-        self.required_columns = required_columns or []
+        self.required_columns = (
+            required_columns if required_columns is not None
+            else TELCO_REQUIRED_COLUMNS
+        )
         self.null_threshold = null_threshold
         self.name = name
         self._report: dict[str, Any] = {}
@@ -51,7 +61,9 @@ class DataValidator:
         self._check_not_empty(data)
         self._check_required_columns(data)
         self._check_null_threshold(data)
-        logger.info("%s passed all checks (%d rows, %d cols)", self.name, *data.shape)
+        logger.info(
+            "%s passed all checks (%d rows, %d cols)", self.name, *data.shape
+        )
 
     # ------------------------------------------------------------------
     # Individual checks
@@ -69,12 +81,16 @@ class DataValidator:
             )
 
     def _check_null_threshold(self, df: pd.DataFrame) -> None:
-        null_rates = df.isnull().mean()
+        # Only check required columns for null threshold to avoid false
+        # positives on optional columns like 'context' or 'difficulty'
+        cols_to_check = [c for c in self.required_columns if c in df.columns]
+        null_rates = df[cols_to_check].isnull().mean()
         violations = null_rates[null_rates > self.null_threshold]
         if not violations.empty:
             details = violations.to_dict()
             raise ValidationError(
-                f"{self.name}: Null rate threshold ({self.null_threshold}) exceeded: {details}"
+                f"{self.name}: Null rate threshold ({self.null_threshold}) "
+                f"exceeded in required columns: {details}"
             )
 
     @property
@@ -87,3 +103,6 @@ class DataValidator:
             f"DataValidator(required={self.required_columns!r}, "
             f"null_threshold={self.null_threshold})"
         )
+
+    def __str__(self) -> str:
+        return f"[Validator:required={self.required_columns}]"
