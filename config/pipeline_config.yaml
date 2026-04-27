@@ -1,22 +1,21 @@
 # Telco Data Pipeline Configuration
 # Dataset: cabbage-dog/The-AI-Telco-Troubleshooting-Challenge
-# Ingested via HuggingFaceConnector from local snapshot
+# Real schema: train.csv — columns: ID, question, answer
 
 pipeline:
   name: telco_troubleshooting_pipeline
-  version: "2.0.0"
+  version: "2.1.0"
   description: >
-    Ingests the AI Telco Troubleshooting Challenge dataset from the local
-    HuggingFace cache snapshot, performs feature engineering, runs SQL
-    aggregations, and writes results to PostgreSQL / HDFS for downstream
-    ML training and evaluation.
+    Ingests the AI Telco Troubleshooting Challenge dataset (train.csv)
+    from the local HuggingFace cache snapshot, performs feature engineering,
+    runs SQL aggregations, and writes results to HDFS / PostgreSQL for
+    downstream ML training and evaluation.
 
 # --- HuggingFace Dataset Source ---
 huggingface:
   dataset_id: "cabbage-dog/The-AI-Telco-Troubleshooting-Challenge"
-  split: "train"
+  split: "train"                        # reads train.csv
   cache_dir: "~/.cache/huggingface/hub"
-  # Absolute path to snapshot downloaded by `hf download`
   local_snapshot: "~/.cache/huggingface/hub/datasets--cabbage-dog--The-AI-Telco-Troubleshooting-Challenge/snapshots/fa38dde4e55b5a821154c8311b48b4738b92eee7"
 
 # --- Kafka (streaming mode — bypassed in --local runs) ---
@@ -45,7 +44,7 @@ sql:
 
 # --- HDFS / Local FS ---
 storage:
-  mode: local           # Options: local | hdfs
+  mode: local
   local_base_path: "./data/intermediate"
   hdfs_base_path: "hdfs://localhost:9000/telco_pipeline"
   checkpoint_dir: "./data/checkpoints"
@@ -54,7 +53,7 @@ storage:
 # --- Spark ---
 spark:
   app_name: TelcoTroubleshootingPipeline
-  master: "local[4]"    # Change to yarn/k8s for cluster
+  master: "local[4]"
   executor_memory: 4g
   driver_memory: 2g
   parallelism: 8
@@ -76,6 +75,7 @@ stages:
     enabled: true
     config:
       required_columns:
+        - ID
         - question
         - answer
       null_threshold: 0.05
@@ -83,19 +83,13 @@ stages:
   - name: feature_engineering
     type: TelcoFeatureEngineeringStage
     enabled: true
-    config:
-      difficulty_map:
-        easy:   1.0
-        medium: 2.0
-        hard:   3.0
+    config: {}          # no extra config needed; all logic is self-contained
 
   - name: spark_transform
     type: SparkTransformationStage
     enabled: true
     config:
       operations:
-        - type: filter
-          condition: "answer_index >= 0"    # keep only rows with matched answers
         - type: drop_nulls
           columns: [question, answer]
 
@@ -104,7 +98,7 @@ stages:
     enabled: true
     config:
       output_table: telco_qa_aggregations
-      # query: override here if needed; defaults to category/difficulty breakdown
+      # query: override here if needed; default groups by scenario_type + answer_letter
 
   - name: write_results
     type: HDFSConnector

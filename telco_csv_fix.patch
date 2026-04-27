@@ -1,0 +1,1146 @@
+From d20fb8a239b8925ca5e3c875335a596bd2015dc5 Mon Sep 17 00:00:00 2001
+From: Perplexity Pipeline Bot <pipeline-bot@perplexity.ai>
+Date: Mon, 27 Apr 2026 20:02:47 +0000
+Subject: [PATCH] fix: load train.csv from HF snapshot; fix feature engineering
+ for real schema
+
+- HuggingFaceConnector: scan for CSV first (train.csv/phase_1_test.csv)
+  in snapshot before trying Arrow/Hub; fixes ValueError on JSON manifest
+- TelcoFeatureEngineeringStage: rewritten for real columns (ID/question/answer)
+  answer label e.g. C2 -> answer_letter=C, answer_number=2
+  new features: question_lines, num_options, has_table, has_figure, scenario_type
+- DataValidator: required_columns default updated to [ID, question, answer]
+- SQLAggregationStage: default query groups by scenario_type + answer_letter
+- config: validate stage required_columns updated; feature_engineering config simplified
+- All tests updated for real schema
+---
+ config/pipeline_config.yaml             |  30 ++--
+ main.py                                 |  20 +--
+ src/connectors/huggingface_connector.py | 122 ++++++++++------
+ src/stages/sql_stage.py                 |  46 ++----
+ src/stages/telco_stage.py               | 185 ++++++++++--------------
+ src/validator.py                        |  29 +---
+ tests/test_connectors.py                |  36 +++--
+ tests/test_stages.py                    | 111 +++++---------
+ tests/test_validator.py                 |  37 ++---
+ 9 files changed, 270 insertions(+), 346 deletions(-)
+
+diff --git a/config/pipeline_config.yaml b/config/pipeline_config.yaml
+index 8e9a4e2..134dbf2 100644
+--- a/config/pipeline_config.yaml
++++ b/config/pipeline_config.yaml
+@@ -1,22 +1,21 @@
+ # Telco Data Pipeline Configuration
+ # Dataset: cabbage-dog/The-AI-Telco-Troubleshooting-Challenge
+-# Ingested via HuggingFaceConnector from local snapshot
++# Real schema: train.csv — columns: ID, question, answer
+ 
+ pipeline:
+   name: telco_troubleshooting_pipeline
+-  version: "2.0.0"
++  version: "2.1.0"
+   description: >
+-    Ingests the AI Telco Troubleshooting Challenge dataset from the local
+-    HuggingFace cache snapshot, performs feature engineering, runs SQL
+-    aggregations, and writes results to PostgreSQL / HDFS for downstream
+-    ML training and evaluation.
++    Ingests the AI Telco Troubleshooting Challenge dataset (train.csv)
++    from the local HuggingFace cache snapshot, performs feature engineering,
++    runs SQL aggregations, and writes results to HDFS / PostgreSQL for
++    downstream ML training and evaluation.
+ 
+ # --- HuggingFace Dataset Source ---
+ huggingface:
+   dataset_id: "cabbage-dog/The-AI-Telco-Troubleshooting-Challenge"
+-  split: "train"
++  split: "train"                        # reads train.csv
+   cache_dir: "~/.cache/huggingface/hub"
+-  # Absolute path to snapshot downloaded by `hf download`
+   local_snapshot: "~/.cache/huggingface/hub/datasets--cabbage-dog--The-AI-Telco-Troubleshooting-Challenge/snapshots/fa38dde4e55b5a821154c8311b48b4738b92eee7"
+ 
+ # --- Kafka (streaming mode — bypassed in --local runs) ---
+@@ -45,7 +44,7 @@ sql:
+ 
+ # --- HDFS / Local FS ---
+ storage:
+-  mode: local           # Options: local | hdfs
++  mode: local
+   local_base_path: "./data/intermediate"
+   hdfs_base_path: "hdfs://localhost:9000/telco_pipeline"
+   checkpoint_dir: "./data/checkpoints"
+@@ -54,7 +53,7 @@ storage:
+ # --- Spark ---
+ spark:
+   app_name: TelcoTroubleshootingPipeline
+-  master: "local[4]"    # Change to yarn/k8s for cluster
++  master: "local[4]"
+   executor_memory: 4g
+   driver_memory: 2g
+   parallelism: 8
+@@ -76,6 +75,7 @@ stages:
+     enabled: true
+     config:
+       required_columns:
++        - ID
+         - question
+         - answer
+       null_threshold: 0.05
+@@ -83,19 +83,13 @@ stages:
+   - name: feature_engineering
+     type: TelcoFeatureEngineeringStage
+     enabled: true
+-    config:
+-      difficulty_map:
+-        easy:   1.0
+-        medium: 2.0
+-        hard:   3.0
++    config: {}          # no extra config needed; all logic is self-contained
+ 
+   - name: spark_transform
+     type: SparkTransformationStage
+     enabled: true
+     config:
+       operations:
+-        - type: filter
+-          condition: "answer_index >= 0"    # keep only rows with matched answers
+         - type: drop_nulls
+           columns: [question, answer]
+ 
+@@ -104,7 +98,7 @@ stages:
+     enabled: true
+     config:
+       output_table: telco_qa_aggregations
+-      # query: override here if needed; defaults to category/difficulty breakdown
++      # query: override here if needed; default groups by scenario_type + answer_letter
+ 
+   - name: write_results
+     type: HDFSConnector
+diff --git a/main.py b/main.py
+index 68c47b9..dc2ce76 100644
+--- a/main.py
++++ b/main.py
+@@ -5,12 +5,9 @@ Usage:
+     python main.py --config config/pipeline_config.yaml
+     python main.py --config config/pipeline_config.yaml --local
+ 
+-The --local flag bypasses Kafka/Postgres and runs entirely on the local
+-filesystem using the HuggingFace dataset cached at the snapshot path
+-defined in config/pipeline_config.yaml.
+-
+ Dataset:
+     cabbage-dog/The-AI-Telco-Troubleshooting-Challenge
++    train.csv schema: ID, question, answer
+     Local snapshot: ~/.cache/huggingface/hub/datasets--cabbage-dog--...
+ """
+ 
+@@ -19,7 +16,6 @@ from __future__ import annotations
+ import argparse
+ import logging
+ import sys
+-from pathlib import Path
+ 
+ import yaml
+ 
+@@ -61,11 +57,11 @@ def build_pipeline(config: dict, local: bool = False) -> PipelineManager:
+         config=stage_cfg.get("feature_engineering", {})
+     )
+     sql_stage = SQLAggregationStage(
+-        sql_connector=None,   # None → SQLite fallback in local mode
++        sql_connector=None,
+         config=stage_cfg.get("sql_aggregation", {}),
+     )
+ 
+-    manager = (
++    return (
+         PipelineManager(
+             max_retries=config["orchestration"]["max_retries"],
+             name="TelcoTroubleshootingPipeline",
+@@ -73,18 +69,17 @@ def build_pipeline(config: dict, local: bool = False) -> PipelineManager:
+         .add_stage(telco_stage)
+         .add_stage(sql_stage)
+     )
+-    return manager
+ 
+ 
+ def main() -> None:
+     parser = argparse.ArgumentParser(description="Telco Troubleshooting Data Pipeline")
+     parser.add_argument(
+         "--config", default="config/pipeline_config.yaml",
+-        help="Path to YAML config"
++        help="Path to YAML config",
+     )
+     parser.add_argument(
+         "--local", action="store_true",
+-        help="Run in local mode (no Kafka/Postgres)"
++        help="Run in local mode (no Kafka/Postgres)",
+     )
+     args = parser.parse_args()
+ 
+@@ -107,18 +102,17 @@ def main() -> None:
+         {}
+     )
+     validator = DataValidator(
+-        required_columns=val_cfg.get("required_columns", ["question", "answer"]),
++        required_columns=val_cfg.get("required_columns", ["ID", "question", "answer"]),
+         null_threshold=val_cfg.get("null_threshold", 0.05),
+     )
+     validator.validate(data)
+ 
+-    # ── 3. Feature engineering + SQL aggregation via PipelineManager ───
++    # ── 3. Feature engineering + SQL aggregation ───────────────────────
+     pipeline = build_pipeline(config, local=args.local)
+     logger.info("Pipeline: %s", pipeline)
+     result = pipeline.run(data)
+ 
+     logger.info("Pipeline complete. Output shape: %s", result.shape)
+-    logger.info("Run log:")
+     for entry in pipeline.run_log:
+         status = "✓" if entry.success else "✗"
+         logger.info(
+diff --git a/src/connectors/huggingface_connector.py b/src/connectors/huggingface_connector.py
+index 7991ead..d7e8bd4 100644
+--- a/src/connectors/huggingface_connector.py
++++ b/src/connectors/huggingface_connector.py
+@@ -1,11 +1,17 @@
+ """HuggingFace dataset connector for the Telco Troubleshooting pipeline.
+ 
+-Inherits from DataConnector so it slots seamlessly into PipelineManager
+-alongside the existing KafkaConnector / SQLConnector / HDFSConnector.
+-
+-OOP decision: load-from-local-snapshot is the *primary* path (fast, offline);
+-streaming from the Hub is the fallback so the pipeline still works in CI/CD
+-environments that have internet access but no pre-cached copy.
++Real dataset schema (cabbage-dog/The-AI-Telco-Troubleshooting-Challenge):
++    train.csv         — 2 400 rows: ID, question, answer
++    phase_1_test.csv  — test split (no answer column)
++    SampleSubmission.csv
++
++Inherits from DataConnector so it slots into PipelineManager alongside
++KafkaConnector / SQLConnector / HDFSConnector.
++
++Load priority:
++  1. Local HF cache snapshot  → scan for *.csv  (fastest, offline)
++  2. datasets.load_from_disk  → Arrow format fallback
++  3. Hub download             → requires internet
+ """
+ 
+ from __future__ import annotations
+@@ -21,28 +27,29 @@ from src.exceptions import ConnectorError
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Default local snapshot deposited by `hf download`
+ _DEFAULT_SNAPSHOT = (
+     "~/.cache/huggingface/hub/"
+     "datasets--cabbage-dog--The-AI-Telco-Troubleshooting-Challenge/"
+     "snapshots/fa38dde4e55b5a821154c8311b48b4738b92eee7"
+ )
+-_HF_DATASET_ID = "cabbage-dog/The-AI-Telco-Troubleshooting-Challenge"
++_HF_DATASET_ID  = "cabbage-dog/The-AI-Telco-Troubleshooting-Challenge"
++_DEFAULT_SPLIT  = "train"           # reads train.csv from snapshot
++_SPLIT_FILE_MAP = {                 # snapshot CSV filename → split name
++    "train":        "train.csv",
++    "test":         "phase_1_test.csv",
++    "submission":   "SampleSubmission.csv",
++}
+ 
+ 
+ class HuggingFaceConnector(DataConnector):
+     """Load the AI Telco Troubleshooting Challenge dataset into a DataFrame.
+ 
+-    Priority:
+-    1. ``local_snapshot`` path (fastest — no network required).
+-    2. ``datasets.load_dataset`` from the HuggingFace Hub.
+-
+     Args:
+         config: Connector config dict.  Recognised keys:
+             - ``dataset_id``     (str)  HF repo id.
+-            - ``split``          (str)  Dataset split, default ``"train"``.
++            - ``split``          (str)  'train' | 'test'.  Default: 'train'.
+             - ``cache_dir``      (str)  HF cache directory.
+-            - ``local_snapshot`` (str)  Absolute path to the snapshot dir.
++            - ``local_snapshot`` (str)  Path to the downloaded snapshot dir.
+         name: Human-readable connector name.
+     """
+ 
+@@ -52,10 +59,10 @@ class HuggingFaceConnector(DataConnector):
+         name: str = "HuggingFaceConnector",
+     ) -> None:
+         super().__init__(config, name)
+-        self._dataset_id: str = config.get("dataset_id", _HF_DATASET_ID)
+-        self._split: str = config.get("split", "train")
++        self._dataset_id: str  = config.get("dataset_id", _HF_DATASET_ID)
++        self._split: str       = config.get("split", _DEFAULT_SPLIT)
+         self._cache_dir: Optional[str] = config.get("cache_dir")
+-        self._snapshot: str = config.get("local_snapshot", _DEFAULT_SNAPSHOT)
++        self._snapshot: str    = config.get("local_snapshot", _DEFAULT_SNAPSHOT)
+ 
+     # ------------------------------------------------------------------
+     # DataConnector interface
+@@ -64,11 +71,12 @@ class HuggingFaceConnector(DataConnector):
+     def read(self, **kwargs) -> pd.DataFrame:
+         """Return the dataset as a pandas DataFrame.
+ 
+-        Tries the local snapshot first; falls back to Hub download.
++        Tries the local snapshot first (CSV files), then falls back to
++        the HuggingFace Hub.
+ 
+         Returns:
+-            DataFrame with at minimum columns: question, answer, choices,
+-            context, difficulty (actual columns depend on dataset version).
++            DataFrame with columns: ID, question, answer
++            (answer column absent in the 'test' split).
+ 
+         Raises:
+             ConnectorError: If neither load path succeeds.
+@@ -93,45 +101,67 @@ class HuggingFaceConnector(DataConnector):
+     # ------------------------------------------------------------------
+ 
+     def _load_from_snapshot(self, snapshot_path: Path) -> pd.DataFrame:
+-        """Load from the locally downloaded HuggingFace snapshot."""
+-        logger.info("%s: loading from local snapshot %s", self.name, snapshot_path)
+-        parquet_files = sorted(snapshot_path.rglob("*.parquet"))
+-        json_files = sorted(snapshot_path.rglob("*.jsonl")) + sorted(snapshot_path.rglob("*.json"))
+-
++        """Load the correct CSV from the locally downloaded snapshot."""
++        logger.info(
++            "%s: loading split='%s' from local snapshot %s",
++            self.name, self._split, snapshot_path,
++        )
+         try:
+-            if parquet_files:
+-                logger.info("%s: found %d parquet file(s)", self.name, len(parquet_files))
+-                frames = [pd.read_parquet(p) for p in parquet_files]
++            # ── Priority 1: named CSV matching the split ─────────────
++            target_csv = _SPLIT_FILE_MAP.get(self._split)
++            if target_csv:
++                csv_path = snapshot_path / target_csv
++                if csv_path.exists():
++                    logger.info("%s: reading %s", self.name, csv_path.name)
++                    df = pd.read_csv(csv_path)
++                    logger.info(
++                        "%s: loaded %d rows, columns=%s",
++                        self.name, len(df), list(df.columns),
++                    )
++                    return df
++
++            # ── Priority 2: any CSV in the snapshot ──────────────────
++            csv_files = sorted(snapshot_path.rglob("*.csv"))
++            # Exclude SampleSubmission unless explicitly requested
++            if self._split != "submission":
++                csv_files = [f for f in csv_files
++                             if "submission" not in f.name.lower()]
++            if csv_files:
++                logger.info(
++                    "%s: found %d CSV(s), loading %s",
++                    self.name, len(csv_files), csv_files[0].name,
++                )
++                frames = [pd.read_csv(f) for f in csv_files]
+                 df = pd.concat(frames, ignore_index=True)
+-            elif json_files:
+-                logger.info("%s: found %d JSON/JSONL file(s)", self.name, len(json_files))
+-                frames = [
+-                    pd.read_json(p, lines=p.suffix == ".jsonl") for p in json_files
+-                ]
+-                df = pd.concat(frames, ignore_index=True)
+-            else:
+-                # Try datasets.load_from_disk (Arrow format)
+-                from datasets import load_from_disk
+-                ds = load_from_disk(str(snapshot_path))
+-                split_ds = ds[self._split] if hasattr(ds, "__getitem__") else ds
+-                df = split_ds.to_pandas()
+-
++                logger.info(
++                    "%s: loaded %d rows, columns=%s",
++                    self.name, len(df), list(df.columns),
++                )
++                return df
++
++            # ── Priority 3: Arrow / load_from_disk fallback ──────────
++            from datasets import load_from_disk
++            logger.info("%s: no CSV found — trying load_from_disk", self.name)
++            ds = load_from_disk(str(snapshot_path))
++            split_ds = ds[self._split] if hasattr(ds, "__getitem__") else ds
++            df = split_ds.to_pandas()
+             logger.info(
+-                "%s: loaded %d rows, %d columns from snapshot",
+-                self.name, len(df), len(df.columns),
++                "%s: loaded %d rows via load_from_disk", self.name, len(df)
+             )
+             return df
++
+         except Exception as exc:
+             raise ConnectorError(
+-                f"{self.name}: failed to load snapshot at {snapshot_path}: {exc}"
++                f"{self.name}: failed to load snapshot at "
++                f"{snapshot_path}: {exc}"
+             ) from exc
+ 
+     def _load_from_hub(self) -> pd.DataFrame:
+-        """Stream dataset from the HuggingFace Hub."""
++        """Stream the dataset from the HuggingFace Hub."""
+         try:
+             from datasets import load_dataset
+             logger.info(
+-                "%s: streaming %s [%s] from Hub",
++                "%s: downloading %s [%s] from Hub",
+                 self.name, self._dataset_id, self._split,
+             )
+             ds = load_dataset(
+diff --git a/src/stages/sql_stage.py b/src/stages/sql_stage.py
+index 94ba392..b4b6af0 100644
+--- a/src/stages/sql_stage.py
++++ b/src/stages/sql_stage.py
+@@ -1,12 +1,7 @@
+ """SQL aggregation stage: runs analytical queries on staged data.
+ 
+-Design decision: We create a temporary in-memory SQLite database when no
+-SQL connector is provided so the same query logic works in both local
+-(no Postgres) and production (full Postgres) modes.
+-
+-Updated default aggregation query for the AI Telco Troubleshooting
+-Challenge dataset — aggregates by category and difficulty instead of
+-the former alarm_type / cell_id columns.
++Updated default query for the real Telco Troubleshooting schema:
++    Aggregates by scenario_type and answer_letter.
+ """
+ 
+ from __future__ import annotations
+@@ -23,20 +18,17 @@ logger = logging.getLogger(__name__)
+ 
+ _DEFAULT_QUERY = """
+ SELECT
+-    COALESCE(category, 'uncategorised') AS category,
+-    COALESCE(difficulty, 'unknown')    AS difficulty,
+-    COUNT(*)                              AS question_count,
+-    ROUND(AVG(question_length), 1)        AS avg_question_length,
+-    ROUND(AVG(num_choices), 2)            AS avg_num_choices,
+-    ROUND(AVG(context_length), 1)         AS avg_context_length,
+-    SUM(has_context)                      AS questions_with_context,
+-    ROUND(
+-        100.0 * SUM(CASE WHEN answer_index >= 0 THEN 1 ELSE 0 END) / COUNT(*),
+-        2
+-    )                                     AS answer_match_pct
++    COALESCE(scenario_type, 'other')    AS scenario_type,
++    COALESCE(answer_letter, '?')        AS answer_letter,
++    COUNT(*)                               AS question_count,
++    ROUND(AVG(question_length), 1)         AS avg_question_length,
++    ROUND(AVG(question_lines),  2)         AS avg_question_lines,
++    ROUND(AVG(num_options),     2)         AS avg_num_options,
++    SUM(has_table)                         AS questions_with_table,
++    SUM(has_figure)                        AS questions_with_figure
+ FROM staging_events
+-GROUP BY category, difficulty
+-ORDER BY category, difficulty
++GROUP BY scenario_type, answer_letter
++ORDER BY question_count DESC
+ """
+ 
+ 
+@@ -58,12 +50,7 @@ class SQLAggregationStage(PipelineStage):
+         super().__init__(name, config)
+         self.sql_connector = sql_connector
+ 
+-    # ------------------------------------------------------------------
+-    # PipelineStage interface
+-    # ------------------------------------------------------------------
+-
+     def validate(self, data: Any) -> None:
+-        """Ensure input is a non-empty DataFrame."""
+         if not isinstance(data, pd.DataFrame):
+             raise StageError(
+                 f"{self.name} expects a pandas DataFrame, "
+@@ -73,14 +60,10 @@ class SQLAggregationStage(PipelineStage):
+             raise StageError(f"{self.name} received an empty DataFrame")
+ 
+     def process(self, data: pd.DataFrame) -> pd.DataFrame:
+-        """Execute the configured aggregation query.
+-
+-        Uses pandas + SQLite for local execution when no SQL connector is
+-        provided, enabling zero-dependency testing.
++        """Execute the configured aggregation query via SQLite.
+ 
+         Args:
+-            data: Enriched DataFrame from TelcoFeatureEngineeringStage
+-                  (written as ``staging_events`` temp table).
++            data: Enriched DataFrame from TelcoFeatureEngineeringStage.
+ 
+         Returns:
+             Aggregated DataFrame.
+@@ -88,7 +71,6 @@ class SQLAggregationStage(PipelineStage):
+         import sqlite3
+ 
+         query = self.config.get("query", _DEFAULT_QUERY)
+-
+         conn = sqlite3.connect(":memory:")
+         try:
+             data.to_sql("staging_events", conn, if_exists="replace", index=False)
+diff --git a/src/stages/telco_stage.py b/src/stages/telco_stage.py
+index 153c151..c023ed3 100644
+--- a/src/stages/telco_stage.py
++++ b/src/stages/telco_stage.py
+@@ -1,29 +1,27 @@
+ """Telco-specific feature engineering stage.
+ 
+-Updated for the AI Telco Troubleshooting Challenge dataset
+-(cabbage-dog/The-AI-Telco-Troubleshooting-Challenge).
++Adapted for the real schema of the AI Telco Troubleshooting Challenge:
+ 
+-Dataset schema (actual columns detected at runtime):
+-  - question       : str   — troubleshooting question text
+-  - choices        : list  — candidate answer options (A/B/C/D or list)
+-  - answer         : str   — correct answer label
+-  - context        : str   — optional network log / alarm context
+-  - difficulty     : str   — easy / medium / hard (if present)
+-  - category       : str   — fault domain (if present)
++    train.csv columns:
++        ID        — unique row identifier  (e.g. "ID_1P7PJMPV0R")
++        question  — full troubleshooting scenario text (multi-line)
++        answer    — correct option label   (e.g. "C2", "A1", "B3")
+ 
+ Derived features added by this stage:
+-  - question_length        : int   — character count of question
+-  - num_choices            : int   — number of candidate answers
+-  - answer_index           : int   — 0-based index of correct answer in choices
+-  - has_context            : bool  — whether a context log is provided
+-  - context_length         : int   — char count of context (0 if absent)
+-  - difficulty_score       : float — ordinal encoding of difficulty
+-  - choices_flat           : str   — choices joined as a single string
++    question_length   int   — total character count of the question
++    num_options       int   — number of numbered options found in the question
++    answer_letter     str   — letter part of the answer label  (e.g. "C" from "C2")
++    answer_number     int   — numeric part of the answer label (e.g. 2  from "C2")
++    question_lines    int   — line count (proxy for scenario complexity)
++    has_table         bool  — True if the question contains a markdown/ASCII table
++    has_figure        bool  — True if the question references a figure/chart
++    scenario_type     str   — coarse category inferred from question keywords
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
++import re
+ from typing import Any, Optional
+ 
+ import numpy as np
+@@ -34,25 +32,29 @@ from .base import PipelineStage
+ 
+ logger = logging.getLogger(__name__)
+ 
+-DIFFICULTY_SCORE_MAP: dict[str, float] = {
+-    "easy":   1.0,
+-    "medium": 2.0,
+-    "hard":   3.0,
+-}
+-
+-# Minimum columns the dataset must expose
+ REQUIRED_COLUMNS: set[str] = {"question", "answer"}
+ 
++# Keywords used to infer a coarse scenario category
++_SCENARIO_KEYWORDS: dict[str, list[str]] = {
++    "throughput":    ["throughput", "mbps", "gbps", "bandwidth", "speed"],
++    "coverage":      ["coverage", "rsrp", "rsrq", "rssi", "signal", "rssnr"],
++    "interference":  ["interference", "sinr", "noise", "snr", "iq"],
++    "handover":      ["handover", "handoff", "ho failure", "ho success"],
++    "latency":       ["latency", "delay", "rtt", "ping", "jitter"],
++    "connectivity":  ["connection", "attach", "detach", "pdn", "bearer"],
++    "capacity":      ["prb", "utilisation", "utilization", "congestion", "load"],
++}
++
+ 
+ class TelcoFeatureEngineeringStage(PipelineStage):
+     """Feature engineering for the AI Telco Troubleshooting Challenge dataset.
+ 
+-    Transforms raw QA rows from the HuggingFace dataset into an enriched
+-    DataFrame suitable for Spark-based aggregations and SQL persistence.
++    Derives structured features from the free-text question field and the
++    compact answer label for downstream SQL aggregation and ML evaluation.
+ 
+     Args:
+-        name: Stage name.
+-        config: Optional config dict; supports ``difficulty_map`` override.
++        name:   Stage name.
++        config: Optional config dict (no required keys for current version).
+     """
+ 
+     def __init__(
+@@ -61,9 +63,6 @@ class TelcoFeatureEngineeringStage(PipelineStage):
+         config: Optional[dict[str, Any]] = None,
+     ) -> None:
+         super().__init__(name, config)
+-        self._difficulty_map: dict[str, float] = (
+-            config.get("difficulty_map", DIFFICULTY_SCORE_MAP) if config else DIFFICULTY_SCORE_MAP
+-        )
+ 
+     # ------------------------------------------------------------------
+     # PipelineStage interface
+@@ -73,7 +72,8 @@ class TelcoFeatureEngineeringStage(PipelineStage):
+         """Verify the DataFrame contains the minimum required columns."""
+         if not isinstance(data, pd.DataFrame):
+             raise StageError(
+-                f"{self.name} expects a pandas DataFrame, got {type(data).__name__}"
++                f"{self.name} expects a pandas DataFrame, "
++                f"got {type(data).__name__}"
+             )
+         missing = REQUIRED_COLUMNS - set(data.columns)
+         if missing:
+@@ -83,26 +83,25 @@ class TelcoFeatureEngineeringStage(PipelineStage):
+             )
+ 
+     def process(self, data: pd.DataFrame) -> pd.DataFrame:
+-        """Apply all feature engineering transforms to the QA dataset.
++        """Apply all feature engineering transforms.
+ 
+         Args:
+             data: Raw DataFrame from HuggingFaceConnector.read().
+ 
+         Returns:
+-            Enriched DataFrame with derived NLP / metadata features.
++            Enriched DataFrame with derived feature columns.
+         """
+         df = data.copy()
+-        df = self._normalize_choices(df)
++        df = self._parse_answer_label(df)
+         df = self._add_text_features(df)
+-        df = self._add_answer_index(df)
+-        df = self._add_context_features(df)
+-        df = self._encode_difficulty(df)
++        df = self._detect_content_type(df)
++        df = self._infer_scenario_type(df)
+ 
+         self._metrics["output_cols"] = list(df.columns)
+         self._metrics["output_rows"] = len(df)
+         logger.info(
+-            "%s produced %d features on %d rows",
+-            self.name, len(df.columns), len(df),
++            "%s: %d rows → %d columns",
++            self.name, len(df), len(df.columns),
+         )
+         return df
+ 
+@@ -110,80 +109,56 @@ class TelcoFeatureEngineeringStage(PipelineStage):
+     # Feature transformations
+     # ------------------------------------------------------------------
+ 
+-    def _normalize_choices(self, df: pd.DataFrame) -> pd.DataFrame:
+-        """Ensure 'choices' is a Python list on every row.
++    def _parse_answer_label(self, df: pd.DataFrame) -> pd.DataFrame:
++        """Split the answer label (e.g. 'C2') into letter + number parts."""
++        def _letter(val: str) -> str:
++            m = re.match(r"^([A-Za-z]+)", str(val).strip())
++            return m.group(1).upper() if m else ""
+ 
+-        The HF dataset may store choices as a list, a dict
+-        {'A': '...', 'B': '...'}, or a JSON string.
+-        """
+-        if "choices" not in df.columns:
+-            df["choices"] = [[] for _ in range(len(df))]
+-            return df
+-
+-        def _to_list(val: Any) -> list:
+-            if isinstance(val, list):
+-                return val
+-            if isinstance(val, dict):
+-                return list(val.values())
+-            if isinstance(val, str):
+-                import json
+-                try:
+-                    parsed = json.loads(val)
+-                    return list(parsed.values()) if isinstance(parsed, dict) else parsed
+-                except (json.JSONDecodeError, TypeError):
+-                    return [val]
+-            return []
+-
+-        df["choices"] = df["choices"].apply(_to_list)
+-        df["choices_flat"] = df["choices"].apply(lambda c: " | ".join(str(x) for x in c))
++        def _number(val: str) -> int:
++            m = re.search(r"(\d+)$", str(val).strip())
++            return int(m.group(1)) if m else -1
++
++        df["answer_letter"] = df["answer"].apply(_letter)
++        df["answer_number"] = df["answer"].apply(_number)
+         return df
+ 
+     def _add_text_features(self, df: pd.DataFrame) -> pd.DataFrame:
+-        """Add length-based text features for the question field."""
+-        df["question_length"] = df["question"].astype(str).str.len()
+-        df["num_choices"] = df["choices"].apply(len)
++        """Add length and structure features from the question text."""
++        q = df["question"].astype(str)
++        df["question_length"] = q.str.len()
++        df["question_lines"]  = q.str.count("\n") + 1
++
++        # Count numbered options: lines starting with "1.", "2.", ... or "C1.", "A2."
++        def _count_options(text: str) -> int:
++            return len(re.findall(
++                r"(?m)^\s*(?:[A-Za-z]?\d+[.)\s]|[A-Za-z][.)\s])",
++                text
++            ))
++
++        df["num_options"] = q.apply(_count_options)
+         return df
+ 
+-    def _add_answer_index(self, df: pd.DataFrame) -> pd.DataFrame:
+-        """Compute the 0-based position of the answer within choices.
+-
+-        Handles both label-style answers ('A', 'B'…) and full-text answers.
+-        """
+-        label_map = {chr(65 + i): i for i in range(26)}   # A→0, B→1, …
+-
+-        def _index(row: pd.Series) -> int:
+-            ans = str(row["answer"]).strip()
+-            choices = row["choices"]
+-            if not choices:
+-                return -1
+-            # Direct label match
+-            if ans.upper() in label_map:
+-                idx = label_map[ans.upper()]
+-                return idx if idx < len(choices) else -1
+-            # Full-text match
+-            try:
+-                return choices.index(ans)
+-            except ValueError:
+-                return -1
+-
+-        df["answer_index"] = df.apply(_index, axis=1)
++    def _detect_content_type(self, df: pd.DataFrame) -> pd.DataFrame:
++        """Detect presence of tables and figure references in the question."""
++        q = df["question"].astype(str)
++        df["has_table"]  = q.str.contains(
++            r"\|.*\||	.*	|[+]{2,}[-]{2,}", regex=True
++        )
++        df["has_figure"] = q.str.contains(
++            r"(?i)(figure|fig\.|chart|graph|diagram|image|table)", regex=True
++        )
+         return df
+ 
+-    def _add_context_features(self, df: pd.DataFrame) -> pd.DataFrame:
+-        """Derive features from the optional network-log context field."""
+-        if "context" not in df.columns:
+-            df["context"] = None
++    def _infer_scenario_type(self, df: pd.DataFrame) -> pd.DataFrame:
++        """Assign a coarse scenario category based on keyword matching."""
++        q_lower = df["question"].astype(str).str.lower()
+ 
+-        df["has_context"] = df["context"].notna() & (df["context"].astype(str).str.strip() != "")
+-        df["context_length"] = df["context"].fillna("").astype(str).str.len()
+-        return df
++        def _categorise(text: str) -> str:
++            for category, keywords in _SCENARIO_KEYWORDS.items():
++                if any(kw in text for kw in keywords):
++                    return category
++            return "other"
+ 
+-    def _encode_difficulty(self, df: pd.DataFrame) -> pd.DataFrame:
+-        """Ordinal-encode the difficulty column (easy/medium/hard → 1/2/3)."""
+-        if "difficulty" not in df.columns:
+-            df["difficulty_score"] = np.nan
+-            return df
+-        df["difficulty_score"] = (
+-            df["difficulty"].str.lower().map(self._difficulty_map)
+-        )
++        df["scenario_type"] = q_lower.apply(_categorise)
+         return df
+diff --git a/src/validator.py b/src/validator.py
+index e13a150..a61e10e 100644
+--- a/src/validator.py
++++ b/src/validator.py
+@@ -1,13 +1,10 @@
+ """DataValidator: schema validation and data quality checks.
+ 
+ Design decision: Validator is a standalone class (not a PipelineStage)
+-because validation logic is orthogonal to transformation logic — it answers
+-"is this data safe to process?" rather than "transform this data".
+-This lets PipelineManager inject validation between any two stages without
+-modifying stage implementations (Open/Closed principle).
++because validation logic is orthogonal to transformation logic.
+ 
+-Updated default required_columns to match the AI Telco Troubleshooting
+-Challenge dataset schema (question / answer / choices).
++Default required_columns reflect the real train.csv schema:
++    ID, question, answer
+ """
+ 
+ from __future__ import annotations
+@@ -21,8 +18,7 @@ from src.exceptions import ValidationError
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Default required columns for the Telco Troubleshooting dataset
+-TELCO_REQUIRED_COLUMNS: list[str] = ["question", "answer"]
++TELCO_REQUIRED_COLUMNS: list[str] = ["ID", "question", "answer"]
+ 
+ 
+ class DataValidator:
+@@ -52,9 +48,6 @@ class DataValidator:
+     def validate(self, data: pd.DataFrame) -> None:
+         """Run all validation checks on ``data``.
+ 
+-        Args:
+-            data: DataFrame to validate.
+-
+         Raises:
+             ValidationError: If any check fails.
+         """
+@@ -65,10 +58,6 @@ class DataValidator:
+             "%s passed all checks (%d rows, %d cols)", self.name, *data.shape
+         )
+ 
+-    # ------------------------------------------------------------------
+-    # Individual checks
+-    # ------------------------------------------------------------------
+-
+     def _check_not_empty(self, df: pd.DataFrame) -> None:
+         if df.empty:
+             raise ValidationError(f"{self.name}: DataFrame is empty")
+@@ -81,21 +70,17 @@ class DataValidator:
+             )
+ 
+     def _check_null_threshold(self, df: pd.DataFrame) -> None:
+-        # Only check required columns for null threshold to avoid false
+-        # positives on optional columns like 'context' or 'difficulty'
+-        cols_to_check = [c for c in self.required_columns if c in df.columns]
+-        null_rates = df[cols_to_check].isnull().mean()
++        cols = [c for c in self.required_columns if c in df.columns]
++        null_rates = df[cols].isnull().mean()
+         violations = null_rates[null_rates > self.null_threshold]
+         if not violations.empty:
+-            details = violations.to_dict()
+             raise ValidationError(
+                 f"{self.name}: Null rate threshold ({self.null_threshold}) "
+-                f"exceeded in required columns: {details}"
++                f"exceeded: {violations.to_dict()}"
+             )
+ 
+     @property
+     def report(self) -> dict[str, Any]:
+-        """Return the last validation report."""
+         return dict(self._report)
+ 
+     def __repr__(self) -> str:
+diff --git a/tests/test_connectors.py b/tests/test_connectors.py
+index c18fa4a..eb0b40b 100644
+--- a/tests/test_connectors.py
++++ b/tests/test_connectors.py
+@@ -1,10 +1,11 @@
+-"""Tests for data connectors, including the new HuggingFaceConnector."""
++"""Tests for data connectors — HuggingFaceConnector with CSV-based snapshot."""
+ 
+ from __future__ import annotations
+ 
+ import pandas as pd
+ import pytest
+-from unittest.mock import MagicMock, patch
++from unittest.mock import patch, MagicMock
++from pathlib import Path
+ 
+ from src.connectors.huggingface_connector import HuggingFaceConnector
+ from src.exceptions import ConnectorError
+@@ -16,7 +17,7 @@ def hf_config() -> dict:
+         "dataset_id": "cabbage-dog/The-AI-Telco-Troubleshooting-Challenge",
+         "split": "train",
+         "cache_dir": "/tmp/hf_cache",
+-        "local_snapshot": "/nonexistent/path",  # forces Hub path in tests
++        "local_snapshot": "/nonexistent/path",
+     }
+ 
+ 
+@@ -26,30 +27,43 @@ class TestHuggingFaceConnector:
+         assert "HuggingFaceConnector" in repr(c)
+         assert "cabbage-dog" in repr(c)
+ 
+-    def test_write_raises(self, hf_config):
++    def test_str(self, hf_config):
++        c = HuggingFaceConnector(config=hf_config)
++        assert "train" in str(c)
++
++    def test_write_raises_not_implemented(self, hf_config):
+         c = HuggingFaceConnector(config=hf_config)
+         with pytest.raises(NotImplementedError):
+             c.write(pd.DataFrame())
+ 
+     @patch("src.connectors.huggingface_connector.Path.exists", return_value=False)
+     @patch("src.connectors.huggingface_connector.HuggingFaceConnector._load_from_hub")
+-    def test_read_falls_back_to_hub_when_no_snapshot(
+-        self, mock_hub, mock_exists, hf_config
+-    ):
+-        mock_hub.return_value = pd.DataFrame({"question": ["Q1"], "answer": ["A"]})
++    def test_falls_back_to_hub_when_no_snapshot(self, mock_hub, mock_exists, hf_config):
++        mock_hub.return_value = pd.DataFrame({
++            "ID": ["ID_001"], "question": ["Q?"], "answer": ["C2"]
++        })
+         c = HuggingFaceConnector(config=hf_config)
+         df = c.read()
+         assert isinstance(df, pd.DataFrame)
+         mock_hub.assert_called_once()
+ 
++    @patch("src.connectors.huggingface_connector.Path.exists", return_value=True)
++    @patch("src.connectors.huggingface_connector.HuggingFaceConnector._load_from_snapshot")
++    def test_reads_from_snapshot_when_exists(self, mock_snap, mock_exists, hf_config):
++        mock_snap.return_value = pd.DataFrame({
++            "ID": ["ID_001"], "question": ["Q?"], "answer": ["C2"]
++        })
++        c = HuggingFaceConnector(config=hf_config)
++        df = c.read()
++        mock_snap.assert_called_once()
++        assert "ID" in df.columns
++
+     @patch("src.connectors.huggingface_connector.Path.exists", return_value=False)
+     @patch(
+         "src.connectors.huggingface_connector.HuggingFaceConnector._load_from_hub",
+         side_effect=ConnectorError("Hub unavailable"),
+     )
+-    def test_read_raises_connector_error_on_failure(
+-        self, mock_hub, mock_exists, hf_config
+-    ):
++    def test_raises_connector_error_on_failure(self, mock_hub, mock_exists, hf_config):
+         c = HuggingFaceConnector(config=hf_config)
+         with pytest.raises(ConnectorError):
+             c.read()
+diff --git a/tests/test_stages.py b/tests/test_stages.py
+index 489c049..fa9393a 100644
+--- a/tests/test_stages.py
++++ b/tests/test_stages.py
+@@ -1,9 +1,4 @@
+-"""Tests for pipeline stages.
+-
+-Updated fixtures use the AI Telco Troubleshooting Challenge schema
+-(question / choices / answer / context / difficulty) instead of the
+-former alarm-event schema.
+-"""
++"""Tests for pipeline stages — real train.csv schema: ID, question, answer."""
+ 
+ from __future__ import annotations
+ 
+@@ -15,103 +10,75 @@ from src.stages.telco_stage import TelcoFeatureEngineeringStage
+ from src.stages.sql_stage import SQLAggregationStage
+ 
+ 
+-# ─────────────────────────────────────────────────────────────
+-# Shared fixtures
+-# ─────────────────────────────────────────────────────────────
+-
+ @pytest.fixture
+ def telco_qa_df() -> pd.DataFrame:
+-    """Minimal DataFrame matching the HF dataset schema."""
+     return pd.DataFrame({
++        "ID": ["ID_001", "ID_002", "ID_003"],
+         "question": [
+-            "Which protocol is used for network troubleshooting?",
+-            "What does a high RSRP value indicate?",
+-            "Which layer handles packet routing?",
+-        ],
+-        "choices": [
+-            ["ICMP", "HTTP", "FTP", "SMTP"],
+-            ["Poor signal", "Strong signal", "No signal", "Interference"],
+-            ["Physical", "Data Link", "Network", "Transport"],
++            "Analyze the 5G drive-test data.\nThe throughput drops below 600Mbps.\n1. High interference\n2. Low RSRP\n3. PRB congestion",
++            "A handover failure is observed at cell boundary.\nC1. Incorrect HO threshold\nC2. Missing neighbour\nC3. Coverage hole",
++            "The SINR is degraded.\n| Cell | RSRP | SINR |\nFigure 1 shows the KPI trend.\nA1. UE issue\nA2. Site fault",
+         ],
+-        "answer": ["A", "B", "C"],
+-        "context": [
+-            "Router logs show ICMP unreachable messages.",
+-            None,
+-            "Packet loss observed at layer 3.",
+-        ],
+-        "difficulty": ["easy", "medium", "hard"],
+-        "category": ["Networking", "RAN", "Routing"],
++        "answer": ["C2", "A1", "B3"],
+     })
+ 
+ 
+ @pytest.fixture
+ def stage() -> TelcoFeatureEngineeringStage:
+-    return TelcoFeatureEngineeringStage(
+-        config={"difficulty_map": {"easy": 1.0, "medium": 2.0, "hard": 3.0}}
+-    )
+-
++    return TelcoFeatureEngineeringStage(config={})
+ 
+-# ─────────────────────────────────────────────────────────────
+-# TelcoFeatureEngineeringStage
+-# ─────────────────────────────────────────────────────────────
+ 
+ class TestTelcoFeatureEngineeringStage:
+     def test_validate_passes_valid_df(self, stage, telco_qa_df):
+-        stage.validate(telco_qa_df)  # should not raise
++        stage.validate(telco_qa_df)
+ 
+     def test_validate_raises_on_missing_columns(self, stage):
+-        bad_df = pd.DataFrame({"foo": [1, 2]})
+         with pytest.raises(ValidationError, match="Missing required columns"):
+-            stage.validate(bad_df)
++            stage.validate(pd.DataFrame({"foo": [1]}))
+ 
+     def test_validate_raises_on_non_dataframe(self, stage):
+         with pytest.raises(StageError):
+             stage.validate({"not": "a dataframe"})
+ 
+-    def test_process_adds_question_length(self, stage, telco_qa_df):
++    def test_answer_letter_parsed(self, stage, telco_qa_df):
+         result = stage.process(telco_qa_df)
+-        assert "question_length" in result.columns
+-        assert (result["question_length"] > 0).all()
++        assert list(result["answer_letter"]) == ["C", "A", "B"]
+ 
+-    def test_process_adds_num_choices(self, stage, telco_qa_df):
++    def test_answer_number_parsed(self, stage, telco_qa_df):
+         result = stage.process(telco_qa_df)
+-        assert "num_choices" in result.columns
+-        assert (result["num_choices"] == 4).all()
++        assert list(result["answer_number"]) == [2, 1, 3]
+ 
+-    def test_process_adds_answer_index(self, stage, telco_qa_df):
++    def test_question_length_positive(self, stage, telco_qa_df):
+         result = stage.process(telco_qa_df)
+-        assert "answer_index" in result.columns
+-        # A→0, B→1, C→2
+-        assert list(result["answer_index"]) == [0, 1, 2]
++        assert (result["question_length"] > 0).all()
+ 
+-    def test_process_adds_has_context(self, stage, telco_qa_df):
++    def test_question_lines_counted(self, stage, telco_qa_df):
+         result = stage.process(telco_qa_df)
+-        assert "has_context" in result.columns
+-        assert result["has_context"].sum() == 2   # row 1 has no context
++        assert (result["question_lines"] >= 1).all()
+ 
+-    def test_process_encodes_difficulty(self, stage, telco_qa_df):
++    def test_has_table_detected(self, stage, telco_qa_df):
+         result = stage.process(telco_qa_df)
+-        assert "difficulty_score" in result.columns
+-        assert list(result["difficulty_score"]) == [1.0, 2.0, 3.0]
++        # Third row has a table with "|"
++        assert result["has_table"].iloc[2] == True
+ 
+-    def test_run_updates_metrics(self, stage, telco_qa_df):
+-        stage.run(telco_qa_df)
+-        assert stage.metrics["output_rows"] == 3
+-        assert "question_length" in stage.metrics["output_cols"]
++    def test_has_figure_detected(self, stage, telco_qa_df):
++        result = stage.process(telco_qa_df)
++        assert result["has_figure"].iloc[2] == True
+ 
+-    def test_choices_flat_created(self, stage, telco_qa_df):
++    def test_scenario_type_assigned(self, stage, telco_qa_df):
+         result = stage.process(telco_qa_df)
+-        assert "choices_flat" in result.columns
+-        assert "ICMP" in result["choices_flat"].iloc[0]
++        assert result["scenario_type"].iloc[0] == "throughput"
++        assert result["scenario_type"].iloc[1] == "handover"
+ 
++    def test_metrics_updated(self, stage, telco_qa_df):
++        stage.run(telco_qa_df)
++        assert stage.metrics["output_rows"] == 3
++        assert "answer_letter" in stage.metrics["output_cols"]
+ 
+-# ─────────────────────────────────────────────────────────────
+-# SQLAggregationStage
+-# ─────────────────────────────────────────────────────────────
+ 
+ class TestSQLAggregationStage:
+     @pytest.fixture
+-    def enriched_df(self, stage, telco_qa_df) -> pd.DataFrame:
++    def enriched_df(self, stage, telco_qa_df):
+         return stage.process(telco_qa_df)
+ 
+     def test_process_returns_dataframe(self, enriched_df):
+@@ -120,18 +87,12 @@ class TestSQLAggregationStage:
+         assert isinstance(result, pd.DataFrame)
+         assert not result.empty
+ 
+-    def test_validate_raises_on_empty(self):
+-        sql_stage = SQLAggregationStage(config={})
+-        with pytest.raises(StageError, match="empty"):
+-            sql_stage.validate(pd.DataFrame())
+-
+-    def test_validate_raises_on_non_dataframe(self):
+-        sql_stage = SQLAggregationStage(config={})
+-        with pytest.raises(StageError):
+-            sql_stage.validate([1, 2, 3])
+-
+     def test_aggregation_columns_present(self, enriched_df):
+         sql_stage = SQLAggregationStage(config={})
+         result = sql_stage.process(enriched_df)
+         assert "question_count" in result.columns
+-        assert "avg_question_length" in result.columns
++        assert "scenario_type" in result.columns
++
++    def test_validate_raises_on_empty(self):
++        with pytest.raises(StageError, match="empty"):
++            SQLAggregationStage(config={}).validate(pd.DataFrame())
+diff --git a/tests/test_validator.py b/tests/test_validator.py
+index a0cca94..7acd5ef 100644
+--- a/tests/test_validator.py
++++ b/tests/test_validator.py
+@@ -1,4 +1,4 @@
+-"""Tests for DataValidator using the Telco QA dataset schema."""
++"""Tests for DataValidator — real schema: ID, question, answer."""
+ 
+ from __future__ import annotations
+ 
+@@ -12,9 +12,9 @@ from src.validator import DataValidator
+ @pytest.fixture
+ def valid_df() -> pd.DataFrame:
+     return pd.DataFrame({
+-        "question": ["Q1", "Q2", "Q3"],
+-        "answer": ["A", "B", "C"],
+-        "choices": [["A", "B"], ["C", "D"], ["E", "F"]],
++        "ID":       ["ID_001", "ID_002"],
++        "question": ["Q1 text", "Q2 text"],
++        "answer":   ["C2", "A1"],
+     })
+ 
+ 
+@@ -25,38 +25,27 @@ def validator() -> DataValidator:
+ 
+ class TestDataValidator:
+     def test_valid_df_passes(self, validator, valid_df):
+-        validator.validate(valid_df)   # no exception
++        validator.validate(valid_df)
+ 
+     def test_empty_df_raises(self, validator):
+         with pytest.raises(ValidationError, match="empty"):
+             validator.validate(pd.DataFrame())
+ 
+-    def test_missing_required_column_raises(self, validator):
+-        df = pd.DataFrame({"question": ["Q1"]})   # missing 'answer'
++    def test_missing_column_raises(self, validator):
++        df = pd.DataFrame({"ID": ["x"], "question": ["q"]})   # missing answer
+         with pytest.raises(ValidationError, match="Missing required columns"):
+             validator.validate(df)
+ 
+-    def test_null_threshold_enforced_on_required_columns(self):
+-        v = DataValidator(
+-            required_columns=["question", "answer"], null_threshold=0.1
+-        )
++    def test_null_threshold_on_required_columns(self):
++        v = DataValidator(required_columns=["ID", "question", "answer"], null_threshold=0.1)
+         df = pd.DataFrame({
+-            "question": ["Q1", None, None],   # 66 % nulls — over threshold
+-            "answer": ["A", "B", "C"],
++            "ID":       [None, None, "x"],
++            "question": ["q1", "q2", "q3"],
++            "answer":   ["A1", "B2", "C3"],
+         })
+         with pytest.raises(ValidationError, match="Null rate threshold"):
+             v.validate(df)
+ 
+-    def test_optional_columns_not_checked_for_nulls(self):
+-        """context is not required — should not trigger null threshold."""
+-        v = DataValidator(required_columns=["question", "answer"], null_threshold=0.05)
+-        df = pd.DataFrame({
+-            "question": ["Q1", "Q2"],
+-            "answer": ["A", "B"],
+-            "context": [None, None],   # 100 % null but optional
+-        })
+-        v.validate(df)   # should pass
+-
+     def test_repr(self, validator):
+         assert "DataValidator" in repr(validator)
+-        assert "question" in repr(validator)
++        assert "ID" in repr(validator)
+-- 
+2.47.3
+

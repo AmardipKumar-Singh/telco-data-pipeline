@@ -5,12 +5,9 @@ Usage:
     python main.py --config config/pipeline_config.yaml
     python main.py --config config/pipeline_config.yaml --local
 
-The --local flag bypasses Kafka/Postgres and runs entirely on the local
-filesystem using the HuggingFace dataset cached at the snapshot path
-defined in config/pipeline_config.yaml.
-
 Dataset:
     cabbage-dog/The-AI-Telco-Troubleshooting-Challenge
+    train.csv schema: ID, question, answer
     Local snapshot: ~/.cache/huggingface/hub/datasets--cabbage-dog--...
 """
 
@@ -19,7 +16,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from pathlib import Path
 
 import yaml
 
@@ -61,11 +57,11 @@ def build_pipeline(config: dict, local: bool = False) -> PipelineManager:
         config=stage_cfg.get("feature_engineering", {})
     )
     sql_stage = SQLAggregationStage(
-        sql_connector=None,   # None → SQLite fallback in local mode
+        sql_connector=None,
         config=stage_cfg.get("sql_aggregation", {}),
     )
 
-    manager = (
+    return (
         PipelineManager(
             max_retries=config["orchestration"]["max_retries"],
             name="TelcoTroubleshootingPipeline",
@@ -73,18 +69,17 @@ def build_pipeline(config: dict, local: bool = False) -> PipelineManager:
         .add_stage(telco_stage)
         .add_stage(sql_stage)
     )
-    return manager
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Telco Troubleshooting Data Pipeline")
     parser.add_argument(
         "--config", default="config/pipeline_config.yaml",
-        help="Path to YAML config"
+        help="Path to YAML config",
     )
     parser.add_argument(
         "--local", action="store_true",
-        help="Run in local mode (no Kafka/Postgres)"
+        help="Run in local mode (no Kafka/Postgres)",
     )
     args = parser.parse_args()
 
@@ -107,18 +102,17 @@ def main() -> None:
         {}
     )
     validator = DataValidator(
-        required_columns=val_cfg.get("required_columns", ["question", "answer"]),
+        required_columns=val_cfg.get("required_columns", ["ID", "question", "answer"]),
         null_threshold=val_cfg.get("null_threshold", 0.05),
     )
     validator.validate(data)
 
-    # ── 3. Feature engineering + SQL aggregation via PipelineManager ───
+    # ── 3. Feature engineering + SQL aggregation ───────────────────────
     pipeline = build_pipeline(config, local=args.local)
     logger.info("Pipeline: %s", pipeline)
     result = pipeline.run(data)
 
     logger.info("Pipeline complete. Output shape: %s", result.shape)
-    logger.info("Run log:")
     for entry in pipeline.run_log:
         status = "✓" if entry.success else "✗"
         logger.info(

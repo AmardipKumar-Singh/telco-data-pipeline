@@ -1,29 +1,27 @@
 """Telco-specific feature engineering stage.
 
-Updated for the AI Telco Troubleshooting Challenge dataset
-(cabbage-dog/The-AI-Telco-Troubleshooting-Challenge).
+Adapted for the real schema of the AI Telco Troubleshooting Challenge:
 
-Dataset schema (actual columns detected at runtime):
-  - question       : str   — troubleshooting question text
-  - choices        : list  — candidate answer options (A/B/C/D or list)
-  - answer         : str   — correct answer label
-  - context        : str   — optional network log / alarm context
-  - difficulty     : str   — easy / medium / hard (if present)
-  - category       : str   — fault domain (if present)
+    train.csv columns:
+        ID        — unique row identifier  (e.g. "ID_1P7PJMPV0R")
+        question  — full troubleshooting scenario text (multi-line)
+        answer    — correct option label   (e.g. "C2", "A1", "B3")
 
 Derived features added by this stage:
-  - question_length        : int   — character count of question
-  - num_choices            : int   — number of candidate answers
-  - answer_index           : int   — 0-based index of correct answer in choices
-  - has_context            : bool  — whether a context log is provided
-  - context_length         : int   — char count of context (0 if absent)
-  - difficulty_score       : float — ordinal encoding of difficulty
-  - choices_flat           : str   — choices joined as a single string
+    question_length   int   — total character count of the question
+    num_options       int   — number of numbered options found in the question
+    answer_letter     str   — letter part of the answer label  (e.g. "C" from "C2")
+    answer_number     int   — numeric part of the answer label (e.g. 2  from "C2")
+    question_lines    int   — line count (proxy for scenario complexity)
+    has_table         bool  — True if the question contains a markdown/ASCII table
+    has_figure        bool  — True if the question references a figure/chart
+    scenario_type     str   — coarse category inferred from question keywords
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 import numpy as np
@@ -34,25 +32,29 @@ from .base import PipelineStage
 
 logger = logging.getLogger(__name__)
 
-DIFFICULTY_SCORE_MAP: dict[str, float] = {
-    "easy":   1.0,
-    "medium": 2.0,
-    "hard":   3.0,
-}
-
-# Minimum columns the dataset must expose
 REQUIRED_COLUMNS: set[str] = {"question", "answer"}
+
+# Keywords used to infer a coarse scenario category
+_SCENARIO_KEYWORDS: dict[str, list[str]] = {
+    "throughput":    ["throughput", "mbps", "gbps", "bandwidth", "speed"],
+    "coverage":      ["coverage", "rsrp", "rsrq", "rssi", "signal", "rssnr"],
+    "interference":  ["interference", "sinr", "noise", "snr", "iq"],
+    "handover":      ["handover", "handoff", "ho failure", "ho success"],
+    "latency":       ["latency", "delay", "rtt", "ping", "jitter"],
+    "connectivity":  ["connection", "attach", "detach", "pdn", "bearer"],
+    "capacity":      ["prb", "utilisation", "utilization", "congestion", "load"],
+}
 
 
 class TelcoFeatureEngineeringStage(PipelineStage):
     """Feature engineering for the AI Telco Troubleshooting Challenge dataset.
 
-    Transforms raw QA rows from the HuggingFace dataset into an enriched
-    DataFrame suitable for Spark-based aggregations and SQL persistence.
+    Derives structured features from the free-text question field and the
+    compact answer label for downstream SQL aggregation and ML evaluation.
 
     Args:
-        name: Stage name.
-        config: Optional config dict; supports ``difficulty_map`` override.
+        name:   Stage name.
+        config: Optional config dict (no required keys for current version).
     """
 
     def __init__(
@@ -61,9 +63,6 @@ class TelcoFeatureEngineeringStage(PipelineStage):
         config: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__(name, config)
-        self._difficulty_map: dict[str, float] = (
-            config.get("difficulty_map", DIFFICULTY_SCORE_MAP) if config else DIFFICULTY_SCORE_MAP
-        )
 
     # ------------------------------------------------------------------
     # PipelineStage interface
@@ -73,7 +72,8 @@ class TelcoFeatureEngineeringStage(PipelineStage):
         """Verify the DataFrame contains the minimum required columns."""
         if not isinstance(data, pd.DataFrame):
             raise StageError(
-                f"{self.name} expects a pandas DataFrame, got {type(data).__name__}"
+                f"{self.name} expects a pandas DataFrame, "
+                f"got {type(data).__name__}"
             )
         missing = REQUIRED_COLUMNS - set(data.columns)
         if missing:
@@ -83,26 +83,25 @@ class TelcoFeatureEngineeringStage(PipelineStage):
             )
 
     def process(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply all feature engineering transforms to the QA dataset.
+        """Apply all feature engineering transforms.
 
         Args:
             data: Raw DataFrame from HuggingFaceConnector.read().
 
         Returns:
-            Enriched DataFrame with derived NLP / metadata features.
+            Enriched DataFrame with derived feature columns.
         """
         df = data.copy()
-        df = self._normalize_choices(df)
+        df = self._parse_answer_label(df)
         df = self._add_text_features(df)
-        df = self._add_answer_index(df)
-        df = self._add_context_features(df)
-        df = self._encode_difficulty(df)
+        df = self._detect_content_type(df)
+        df = self._infer_scenario_type(df)
 
         self._metrics["output_cols"] = list(df.columns)
         self._metrics["output_rows"] = len(df)
         logger.info(
-            "%s produced %d features on %d rows",
-            self.name, len(df.columns), len(df),
+            "%s: %d rows → %d columns",
+            self.name, len(df), len(df.columns),
         )
         return df
 
@@ -110,80 +109,56 @@ class TelcoFeatureEngineeringStage(PipelineStage):
     # Feature transformations
     # ------------------------------------------------------------------
 
-    def _normalize_choices(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Ensure 'choices' is a Python list on every row.
+    def _parse_answer_label(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Split the answer label (e.g. 'C2') into letter + number parts."""
+        def _letter(val: str) -> str:
+            m = re.match(r"^([A-Za-z]+)", str(val).strip())
+            return m.group(1).upper() if m else ""
 
-        The HF dataset may store choices as a list, a dict
-        {'A': '...', 'B': '...'}, or a JSON string.
-        """
-        if "choices" not in df.columns:
-            df["choices"] = [[] for _ in range(len(df))]
-            return df
+        def _number(val: str) -> int:
+            m = re.search(r"(\d+)$", str(val).strip())
+            return int(m.group(1)) if m else -1
 
-        def _to_list(val: Any) -> list:
-            if isinstance(val, list):
-                return val
-            if isinstance(val, dict):
-                return list(val.values())
-            if isinstance(val, str):
-                import json
-                try:
-                    parsed = json.loads(val)
-                    return list(parsed.values()) if isinstance(parsed, dict) else parsed
-                except (json.JSONDecodeError, TypeError):
-                    return [val]
-            return []
-
-        df["choices"] = df["choices"].apply(_to_list)
-        df["choices_flat"] = df["choices"].apply(lambda c: " | ".join(str(x) for x in c))
+        df["answer_letter"] = df["answer"].apply(_letter)
+        df["answer_number"] = df["answer"].apply(_number)
         return df
 
     def _add_text_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add length-based text features for the question field."""
-        df["question_length"] = df["question"].astype(str).str.len()
-        df["num_choices"] = df["choices"].apply(len)
+        """Add length and structure features from the question text."""
+        q = df["question"].astype(str)
+        df["question_length"] = q.str.len()
+        df["question_lines"]  = q.str.count("\n") + 1
+
+        # Count numbered options: lines starting with "1.", "2.", ... or "C1.", "A2."
+        def _count_options(text: str) -> int:
+            return len(re.findall(
+                r"(?m)^\s*(?:[A-Za-z]?\d+[.)\s]|[A-Za-z][.)\s])",
+                text
+            ))
+
+        df["num_options"] = q.apply(_count_options)
         return df
 
-    def _add_answer_index(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute the 0-based position of the answer within choices.
-
-        Handles both label-style answers ('A', 'B'…) and full-text answers.
-        """
-        label_map = {chr(65 + i): i for i in range(26)}   # A→0, B→1, …
-
-        def _index(row: pd.Series) -> int:
-            ans = str(row["answer"]).strip()
-            choices = row["choices"]
-            if not choices:
-                return -1
-            # Direct label match
-            if ans.upper() in label_map:
-                idx = label_map[ans.upper()]
-                return idx if idx < len(choices) else -1
-            # Full-text match
-            try:
-                return choices.index(ans)
-            except ValueError:
-                return -1
-
-        df["answer_index"] = df.apply(_index, axis=1)
-        return df
-
-    def _add_context_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Derive features from the optional network-log context field."""
-        if "context" not in df.columns:
-            df["context"] = None
-
-        df["has_context"] = df["context"].notna() & (df["context"].astype(str).str.strip() != "")
-        df["context_length"] = df["context"].fillna("").astype(str).str.len()
-        return df
-
-    def _encode_difficulty(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Ordinal-encode the difficulty column (easy/medium/hard → 1/2/3)."""
-        if "difficulty" not in df.columns:
-            df["difficulty_score"] = np.nan
-            return df
-        df["difficulty_score"] = (
-            df["difficulty"].str.lower().map(self._difficulty_map)
+    def _detect_content_type(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Detect presence of tables and figure references in the question."""
+        q = df["question"].astype(str)
+        df["has_table"]  = q.str.contains(
+            r"\|.*\||	.*	|[+]{2,}[-]{2,}", regex=True
         )
+        df["has_figure"] = q.str.contains(
+            r"(?i)(figure|fig\.|chart|graph|diagram|image|table)", regex=True
+        )
+        return df
+
+    def _infer_scenario_type(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Assign a coarse scenario category based on keyword matching."""
+        q_lower = df["question"].astype(str).str.lower()
+
+        def _categorise(text: str) -> str:
+            for category, keywords in _SCENARIO_KEYWORDS.items():
+                if any(kw in text for kw in keywords):
+                    return category
+            return "other"
+
+        df["scenario_type"] = q_lower.apply(_categorise)
         return df
